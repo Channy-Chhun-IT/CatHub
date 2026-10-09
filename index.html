@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <script>
+      (function () {
+        try {
+          var _origFetch =
+            typeof window !== "undefined" && window.fetch
+              ? window.fetch.bind(window)
+              : null;
+          var _fetch = _origFetch;
+
+          Object.defineProperty(window, "fetch", {
+            get: function () {
+              return _fetch;
+            },
+            set: function (newFetch) {
+              _fetch = typeof newFetch === "function" ? newFetch : _origFetch;
+            },
+            configurable: true,
+            enumerable: true,
+          });
+
+          if (typeof Window !== "undefined" && Window.prototype) {
+            try {
+              Object.defineProperty(Window.prototype, "fetch", {
+                get: function () {
+                  return _fetch;
+                },
+                set: function (newFetch) {
+                  _fetch =
+                    typeof newFetch === "function" ? newFetch : _origFetch;
+                },
+                configurable: true,
+                enumerable: true,
+              });
+            } catch (protoErr) {}
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CatHub</title>
+    <meta
+      name="description"
+      content="Download and preserve archived website assets, files, and URLs from the Wayback Machine by domain and timestamp with retry handling and ZIP export."
+    />
+    <meta property="og:title" content="Wayback Asset Downloader" />
+    <meta
+      property="og:description"
+      content="Download and preserve archived website assets, files, and URLs from the Wayback Machine by domain and timestamp with retry handling and ZIP export."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&amp;family=JetBrains+Mono:wght@400;500;600&amp;display=swap"
+      rel="stylesheet"
+    />
+    <script
+      type="module"
+      crossorigin=""
+      src="./assets/index-Daq2QkEW.js"
+    ></script>
+    <link rel="stylesheet" crossorigin="" href="./assets/index-BhIyfKiD.css" />
+  </head>
+  <body
+    class="bg-[#020705] text-emerald-100 font-sans antialiased min-h-screen selection:bg-emerald-900 selection:text-emerald-100"
+  >
+    <div id="root"></div>
+  </body>
+</html>
