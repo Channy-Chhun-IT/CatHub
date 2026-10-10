@@ -1,0 +1,7 @@
+{
+  "name": "CatHub",
+  "description": "Download and preserve archived website assets, files, and URLs from the Wayback Machine by domain and timestamp with retry handling and ZIP export.",
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
