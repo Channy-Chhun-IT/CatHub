@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { type Request, type Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import dns from 'dns';
@@ -131,6 +131,35 @@ function computeRelativePath(rawUrl: string, targetDomain: string): string {
     const stripped = rawUrl.replace(/^https?:\/\//i, '').replace(/[<>:"|?*]/g, '_');
     return path.normalize(stripped).replace(/^(\.\.[\/\\])+/, '') || 'asset.bin';
   }
+}
+
+// Helper to generate alternative protocol and subdomain URLs if primary returns 404 in Wayback
+function getAlternativeUrls(urlStr: string): string[] {
+  const alts: string[] = [];
+  try {
+    const urlObj = new URL(urlStr);
+    const isHttps = urlObj.protocol === 'https:';
+    const altProto = isHttps ? 'http:' : 'https:';
+    const hasWww = urlObj.hostname.toLowerCase().startsWith('www.');
+
+    // 1. Same host, alternative protocol
+    const u1 = new URL(urlStr);
+    u1.protocol = altProto;
+    alts.push(u1.toString());
+
+    // 2. Toggled www
+    const altHost = hasWww ? urlObj.hostname.replace(/^www\./i, '') : `www.${urlObj.hostname}`;
+    const u2 = new URL(urlStr);
+    u2.hostname = altHost;
+    alts.push(u2.toString());
+
+    // 3. Toggled www + alternative protocol
+    const u3 = new URL(urlStr);
+    u3.protocol = altProto;
+    u3.hostname = altHost;
+    alts.push(u3.toString());
+  } catch {}
+  return alts.filter(u => u !== urlStr);
 }
 
 // Helper to deduce MIME type
@@ -511,7 +540,7 @@ app.post('/api/jobs', (req: Request, res: Response) => {
     return {
       id: `file_${index + 1}_${Math.random().toString(36).substring(2, 6)}`,
       originalUrl: urlStr,
-      waybackUrl: `https://web.archive.org/web/${cleanTimestamp}/${urlStr}`,
+      waybackUrl: `https://web.archive.org/web/${cleanTimestamp}id_/${urlStr}`,
       relativePath: relPath,
       status: 'pending',
       size: 0,
@@ -756,73 +785,117 @@ async function processJob(jobId: string) {
       let lastError = '';
       let lastStatusCode = 0;
 
+      const candidateUrls = [file.originalUrl, ...getAlternativeUrls(file.originalUrl)];
+
       for (let attempt = 0; attempt <= job.config.maxRetries; attempt++) {
         if (job.status !== 'running') break;
 
         file.retryCount = attempt;
 
-        try {
-          // Fetch raw identity snapshot with reliable curl UA
-          const directWaybackUrl = `https://web.archive.org/web/${job.config.timestamp}id_/${file.originalUrl}`;
-          const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 18000);
+        let shouldRetryAttempt = false;
 
-          const response = await fetch(directWaybackUrl, {
-            signal: controller.signal,
-            redirect: 'follow',
-            headers: {
-              'User-Agent': WAYBACK_USER_AGENT,
-              'Accept': '*/*',
-            },
-          });
-          clearTimeout(timeoutId);
+        for (const candidateUrl of candidateUrls) {
+          if (job.status !== 'running') break;
 
-          lastStatusCode = response.status;
+          try {
+            // Fetch raw identity snapshot with reliable curl UA
+            const directWaybackUrl = `https://web.archive.org/web/${job.config.timestamp}id_/${candidateUrl}`;
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 18000);
 
-          if (response.status === 200) {
-            const arrayBuffer = await response.arrayBuffer();
-            const buffer = Buffer.from(arrayBuffer);
+            const response = await fetch(directWaybackUrl, {
+              signal: controller.signal,
+              redirect: 'follow',
+              headers: {
+                'User-Agent': WAYBACK_USER_AGENT,
+                'Accept': '*/*',
+              },
+            });
+            clearTimeout(timeoutId);
 
-            const localFilePath = path.join(jobDir, file.relativePath);
-            fs.mkdirSync(path.dirname(localFilePath), { recursive: true });
-            fs.writeFileSync(localFilePath, buffer);
-
-            file.status = 'success';
-            file.size = buffer.length;
-            file.statusCode = 200;
-            file.mimeType = determineMimeType(file.relativePath, response.headers.get('content-type'));
-
-            job.progress.success++;
-            job.progress.totalBytes += buffer.length;
-            success = true;
-            break;
-          } else if (response.status === 404) {
-            lastError = 'Archived asset not found (HTTP 404)';
-            lastStatusCode = 404;
-            break;
-          } else if (response.status === 403 || response.status === 429) {
-            const waybackIp = await getWaybackIp();
-            lastError = `connect ECONNREFUSED ${waybackIp}:443`;
             lastStatusCode = response.status;
-            if (attempt < job.config.maxRetries) {
-              await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+
+            if (response.status === 200) {
+              const arrayBuffer = await response.arrayBuffer();
+              const buffer = Buffer.from(arrayBuffer);
+
+              const localFilePath = path.join(jobDir, file.relativePath);
+              fs.mkdirSync(path.dirname(localFilePath), { recursive: true });
+              fs.writeFileSync(localFilePath, buffer);
+
+              file.status = 'success';
+              file.size = buffer.length;
+              file.statusCode = 200;
+              file.mimeType = determineMimeType(file.relativePath, response.headers.get('content-type'));
+              file.waybackUrl = `https://web.archive.org/web/${job.config.timestamp}id_/${candidateUrl}`;
+
+              job.progress.success++;
+              job.progress.totalBytes += buffer.length;
+              success = true;
+              break;
+            } else if (response.status === 404) {
+              lastError = 'Archived asset not found (HTTP 404)';
+              // Try next alternative candidate URL
+              continue;
+            } else if (response.status === 403 || response.status === 429) {
+              const waybackIp = await getWaybackIp();
+              lastError = `connect ECONNREFUSED ${waybackIp}:443`;
+              lastStatusCode = response.status;
+              shouldRetryAttempt = true;
+              break;
+            } else if (response.status >= 500) {
+              lastError = `HTTP ${response.status}: Wayback service busy`;
+              shouldRetryAttempt = true;
+              break;
+            } else {
+              lastError = `HTTP ${response.status}: Failed to retrieve asset`;
+              continue;
             }
-          } else if (response.status >= 500) {
-            lastError = `HTTP ${response.status}: Wayback service busy`;
-            if (attempt < job.config.maxRetries) {
-              await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
-            }
-          } else {
-            lastError = `HTTP ${response.status}: Failed to retrieve asset`;
+          } catch (fetchErr: any) {
+            const waybackIp = fetchErr?.cause?.address || (await getWaybackIp());
+            const port = fetchErr?.cause?.port || 443;
+            const code = fetchErr?.cause?.code || 'ECONNREFUSED';
+            lastError = `connect ${code} ${waybackIp}:${port}`;
+            shouldRetryAttempt = true;
             break;
           }
-        } catch (fetchErr: any) {
-          const waybackIp = fetchErr?.cause?.address || (await getWaybackIp());
-          const port = fetchErr?.cause?.port || 443;
-          const code = fetchErr?.cause?.code || 'ECONNREFUSED';
-          lastError = `connect ${code} ${waybackIp}:${port}`;
-          if (attempt < job.config.maxRetries) {
-            await new Promise(r => setTimeout(r, 1200 * (attempt + 1)));
+        }
+
+        if (success) break;
+
+        if (shouldRetryAttempt && attempt < job.config.maxRetries) {
+          const isThrottle =
+            lastStatusCode === 429 ||
+            lastStatusCode === 403 ||
+            lastError.includes('ECONNREFUSED') ||
+            lastError.includes('ECONNRESET');
+
+          if (isThrottle) {
+            const cooldownSecs = 60 + attempt * 15; // 60s on attempt 1, 75s on attempt 2, 90s on attempt 3
+            const cooldownMs = cooldownSecs * 1000;
+            file.error = `Rate limit throttle: cooling down ${cooldownSecs}s before retry ${attempt + 1}/${job.config.maxRetries}...`;
+            job.logs.push({
+              timestamp: new Date().toISOString(),
+              message: `⚠️ Wayback rate limit throttle detected (ECONNREFUSED / HTTP ${lastStatusCode || 429}). Auto-pausing for ${cooldownSecs}s to let archive firewall reset before retry ${attempt + 1}...`,
+              level: 'warn',
+            });
+
+            // Responsive cooldown loop checking for user cancel or pause
+            const startWait = Date.now();
+            while (Date.now() - startWait < cooldownMs && job.status === 'running') {
+              await new Promise(r => setTimeout(r, 1000));
+            }
+
+            if (job.status === 'running') {
+              job.logs.push({
+                timestamp: new Date().toISOString(),
+                message: `✅ Cooldown of ${cooldownSecs}s completed. Resuming download for ${file.relativePath}...`,
+                level: 'info',
+              });
+              file.error = undefined;
+            }
+          } else {
+            await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
           }
         }
       }
