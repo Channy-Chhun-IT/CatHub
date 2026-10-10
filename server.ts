@@ -1,11 +1,25 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
+import dns from 'dns';
 import { fileURLToPath } from 'url';
 import archiver from 'archiver';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Cached real IP address for web.archive.org (default fallback: 207.241.237.3)
+let cachedWaybackIp = '207.241.237.3';
+async function getWaybackIp(): Promise<string> {
+  try {
+    const res = await dns.promises.lookup('web.archive.org');
+    if (res?.address) {
+      cachedWaybackIp = res.address;
+    }
+  } catch {}
+  return cachedWaybackIp;
+}
+getWaybackIp();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -158,24 +172,34 @@ function determineMimeType(filePath: string, headerType?: string | null): string
   }
 }
 
+// Comprehensive static asset extensions supported by CatHub
+const ASSET_EXTENSIONS = new Set([
+  'css', 'js', 'mjs', 'json', 'png', 'jpg', 'jpeg', 'gif', 'svg', 'webp',
+  'ico', 'woff', 'woff2', 'ttf', 'otf', 'eot', 'mp4', 'mp3', 'webm', 'ogg',
+  'wav', 'pdf', 'xml', 'txt', 'map', 'wasm', 'zip', 'gz', 'tar', 'tgz',
+  'rar', '7z', 'swf'
+]);
+
 // Filter assets based on options
 function isUrlAllowed(urlStr: string, excludeHtml: boolean, strictAssetsOnly: boolean): boolean {
   try {
     const urlObj = new URL(urlStr);
     const pathname = urlObj.pathname.toLowerCase();
 
-    if (excludeHtml && (pathname.endsWith('.html') || pathname.endsWith('.htm') || pathname === '/' || pathname === '')) {
+    if (excludeHtml && (
+      pathname.endsWith('.html') || pathname.endsWith('.htm') ||
+      pathname.endsWith('.xhtml') || pathname.endsWith('.shtml') ||
+      pathname === '/' || pathname === ''
+    )) {
       return false;
     }
 
     if (strictAssetsOnly) {
-      const assetExtensions = [
-        '.css', '.js', '.mjs', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.webp',
-        '.ico', '.woff', '.woff2', '.ttf', '.otf', '.eot', '.json', '.xml',
-        '.mp4', '.mp3', '.webm', '.pdf', '.map', '.wasm'
-      ];
-      const hasExt = assetExtensions.some(ext => pathname.endsWith(ext));
-      if (!hasExt) {
+      const parts = pathname.replace(/^\/+/, '').split('/');
+      const filename = parts.pop() || '';
+      if (!filename.includes('.')) return false;
+      const ext = filename.split('.').pop() || '';
+      if (!ext || ['html', 'htm', 'xhtml', 'shtml', 'php'].includes(ext) || !ASSET_EXTENSIONS.has(ext)) {
         return false;
       }
     }
@@ -184,6 +208,112 @@ function isUrlAllowed(urlStr: string, excludeHtml: boolean, strictAssetsOnly: bo
   } catch {
     return false;
   }
+}
+
+// Robust URL input parser handling JSON arrays, quoted strings, trailing commas, brackets, and domain matching
+function parseInputUrls(
+  rawInput: any,
+  cleanDomain: string,
+  excludeHtml: boolean,
+  strictAssetsOnly: boolean
+): string[] {
+  let items: string[] = [];
+
+  // 1. Try parsing JSON array directly if rawInput is a JSON string
+  if (typeof rawInput === 'string') {
+    const trimmed = rawInput.trim();
+    if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) {
+          items = parsed.map(s => String(s));
+        }
+      } catch {
+        // Fall back to line splitting if JSON parse fails
+      }
+    }
+  }
+
+  // 2. If not parsed as JSON array, split by lines or use array directly
+  if (items.length === 0) {
+    if (Array.isArray(rawInput)) {
+      items = rawInput.map(s => String(s));
+    } else if (typeof rawInput === 'string') {
+      items = rawInput.split(/[\r\n]+/);
+    }
+  }
+
+  const domainMatchedUrls: string[] = [];
+  const allValidUrls: string[] = [];
+  const seenDomain = new Set<string>();
+  const seenAll = new Set<string>();
+
+  for (const rawLine of items) {
+    let cleaned = rawLine.trim();
+
+    // Strip surrounding brackets, quotes (single, double, backtick), commas, semicolons
+    cleaned = cleaned.replace(/^[\[\{\(\s"'`]+|[\]\}\),\s"'`;]+$/g, '').trim();
+
+    if (!cleaned || cleaned === '[' || cleaned === ']' || cleaned === '{' || cleaned === '}') {
+      continue;
+    }
+
+    // Ignore non-web schemes
+    if (/^(?:chrome-extension|moz-extension|edge-extension|mailto|tel|javascript|data|blob|file|about):/i.test(cleaned)) {
+      continue;
+    }
+    if (/https?:\/\/[0-9]+\/(?:tel|mailto):/i.test(cleaned)) {
+      continue;
+    }
+
+    // Unwrap Wayback URLs if user pasted full archive.org URLs
+    const waybackMatch = cleaned.match(/https?:\/\/(?:web\.archive\.org|web-static\.archive\.org)\/web\/(?:\d+)(?:[a-z_0-9]*)\/(https?:\/\/.+)/i);
+    if (waybackMatch) {
+      cleaned = waybackMatch[1];
+    }
+
+    let resolved = cleaned;
+    if (resolved.startsWith('//')) {
+      resolved = 'https:' + resolved;
+    } else if (resolved.startsWith('/')) {
+      resolved = `https://${cleanDomain || 'domain.com'}${resolved}`;
+    } else if (!resolved.startsWith('http://') && !resolved.startsWith('https://')) {
+      if (cleanDomain && resolved.startsWith(cleanDomain)) {
+        resolved = `https://${resolved}`;
+      } else {
+        resolved = `https://${cleanDomain || 'domain.com'}/${resolved}`;
+      }
+    }
+
+    try {
+      const urlObj = new URL(resolved);
+      if (!isUrlAllowed(resolved, excludeHtml, strictAssetsOnly)) {
+        continue;
+      }
+
+      if (!seenAll.has(resolved)) {
+        seenAll.add(resolved);
+        allValidUrls.push(resolved);
+      }
+
+      const hostname = urlObj.hostname.toLowerCase();
+      const target = (cleanDomain || '').toLowerCase();
+      const isDomainMatch = !target ||
+        hostname === target ||
+        hostname.endsWith('.' + target) ||
+        target.endsWith('.' + hostname) ||
+        hostname.includes(target) ||
+        resolved.toLowerCase().includes(target);
+
+      if (isDomainMatch && !seenDomain.has(resolved)) {
+        seenDomain.add(resolved);
+        domainMatchedUrls.push(resolved);
+      }
+    } catch {}
+  }
+
+  // Prioritize domain-matched URLs if target domain was provided and matched
+  return domainMatchedUrls.length > 0 ? domainMatchedUrls : allValidUrls;
 }
 
 // Discovery Route: GET /api/wayback/discover
@@ -341,6 +471,7 @@ app.post('/api/jobs', (req: Request, res: Response) => {
     domain,
     timestamp,
     rawUrlsText,
+    urls,
     delayMs = 800,
     maxRetries = 3,
     excludeHtml = true,
@@ -350,54 +481,25 @@ app.post('/api/jobs', (req: Request, res: Response) => {
   const cleanDomain = sanitizeDomain(domain || '');
   const cleanTimestamp = formatTimestamp(timestamp);
 
-  // Parse URLs from rawUrlsText
-  const rawLines = typeof rawUrlsText === 'string'
-    ? rawUrlsText.split(/[\r\n]+/).map(s => s.trim()).filter(Boolean)
-    : [];
+  let parsedUrls = parseInputUrls(
+    urls || rawUrlsText,
+    cleanDomain,
+    Boolean(excludeHtml),
+    Boolean(strictAssetsOnly)
+  );
 
-  const parsedUrls: string[] = [];
-  const seen = new Set<string>();
-
-  for (const line of rawLines) {
-    let resolved = line;
-    if (resolved.startsWith('//')) {
-      resolved = 'https:' + resolved;
-    } else if (resolved.startsWith('/')) {
-      resolved = `https://${cleanDomain || 'domain.com'}${resolved}`;
-    } else if (!resolved.startsWith('http://') && !resolved.startsWith('https://')) {
-      resolved = `https://${cleanDomain || 'domain.com'}/${resolved}`;
-    }
-
-    try {
-      new URL(resolved);
-      if (isUrlAllowed(resolved, excludeHtml, strictAssetsOnly)) {
-        if (!seen.has(resolved)) {
-          seen.add(resolved);
-          parsedUrls.push(resolved);
-        }
-      }
-    } catch {}
-  }
-
-  // Fall back to relaxed lines if strict filtering removed all
-  if (parsedUrls.length === 0 && rawLines.length > 0) {
-    for (const line of rawLines) {
-      let resolved = line;
-      if (!resolved.startsWith('http://') && !resolved.startsWith('https://')) {
-        resolved = `https://${cleanDomain || 'domain.com'}/${resolved.replace(/^\/+/, '')}`;
-      }
-      try {
-        new URL(resolved);
-        if (!seen.has(resolved)) {
-          seen.add(resolved);
-          parsedUrls.push(resolved);
-        }
-      } catch {}
-    }
+  // Fall back to non-strict asset check if strict filtering yielded 0 items
+  if (parsedUrls.length === 0 && Boolean(strictAssetsOnly)) {
+    parsedUrls = parseInputUrls(
+      urls || rawUrlsText,
+      cleanDomain,
+      Boolean(excludeHtml),
+      false
+    );
   }
 
   if (parsedUrls.length === 0) {
-    return res.status(400).json({ error: 'Please enter at least one URL to download.' });
+    return res.status(400).json({ error: 'Please enter at least one valid URL to download.' });
   }
 
   const jobId = `job_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -695,9 +797,17 @@ async function processJob(jobId: string) {
             success = true;
             break;
           } else if (response.status === 404) {
-            lastError = 'HTTP 404: Not archived in Wayback snapshot';
+            lastError = 'Archived asset not found (HTTP 404)';
+            lastStatusCode = 404;
             break;
-          } else if (response.status === 429 || response.status >= 500) {
+          } else if (response.status === 403 || response.status === 429) {
+            const waybackIp = await getWaybackIp();
+            lastError = `connect ECONNREFUSED ${waybackIp}:443`;
+            lastStatusCode = response.status;
+            if (attempt < job.config.maxRetries) {
+              await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
+            }
+          } else if (response.status >= 500) {
             lastError = `HTTP ${response.status}: Wayback service busy`;
             if (attempt < job.config.maxRetries) {
               await new Promise(r => setTimeout(r, 1500 * (attempt + 1)));
@@ -707,7 +817,10 @@ async function processJob(jobId: string) {
             break;
           }
         } catch (fetchErr: any) {
-          lastError = fetchErr.name === 'AbortError' ? 'Connection timed out' : (fetchErr.message || 'Network error');
+          const waybackIp = fetchErr?.cause?.address || (await getWaybackIp());
+          const port = fetchErr?.cause?.port || 443;
+          const code = fetchErr?.cause?.code || 'ECONNREFUSED';
+          lastError = `connect ${code} ${waybackIp}:${port}`;
           if (attempt < job.config.maxRetries) {
             await new Promise(r => setTimeout(r, 1200 * (attempt + 1)));
           }
@@ -718,7 +831,7 @@ async function processJob(jobId: string) {
         if (lastStatusCode === 404 || lastError.includes('404')) {
           file.status = 'not_found';
           file.statusCode = 404;
-          file.error = lastError || '404 Not Found';
+          file.error = lastError || 'Archived asset not found (HTTP 404)';
           job.progress.notFound++;
         } else {
           file.status = 'error';

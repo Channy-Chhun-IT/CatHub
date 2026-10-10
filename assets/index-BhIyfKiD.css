@@ -206,3 +206,30 @@ button[type="submit"]:hover {
   line-height: 1 !important;
   box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3) !important;
 }
+
+/* Table Header (Local Path / Size / Status / Actions) - Solid colored background on scroll */
+#downloaded-files-table thead {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 30 !important;
+  background-color: #17211c !important;
+}
+
+#downloaded-files-table thead tr {
+  background-color: #17211c !important;
+}
+
+#downloaded-files-table thead th {
+  position: sticky !important;
+  top: 0 !important;
+  z-index: 30 !important;
+  background-color: #17211c !important;
+  color: #cbd5e1 !important;
+  border-bottom: 2px solid #283e33 !important;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.75) !important;
+}
+
+#downloaded-files-table thead th code {
+  color: #ff9000 !important;
+}
+
