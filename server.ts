@@ -954,9 +954,34 @@ app.get(['/logo.png', '/assets/logo.png'], (req: Request, res: Response) => {
   return res.sendFile(target);
 });
 
-// Static file serving: Serve built client bundle
-app.use(express.static(__dirname));
-app.use('/assets', express.static(path.join(__dirname, 'assets')));
+// Security middleware: explicitly block access to backend source files, configs, and hidden files
+app.use((req: Request, res: Response, next) => {
+  const cleanPath = req.path.toLowerCase();
+  if (
+    cleanPath.endsWith('.ts') ||
+    cleanPath.endsWith('.tsx') ||
+    cleanPath.endsWith('.json') ||
+    cleanPath.endsWith('.map') ||
+    cleanPath.endsWith('.lock') ||
+    cleanPath.endsWith('.env') ||
+    cleanPath.includes('/.') ||
+    cleanPath.includes('/..')
+  ) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  next();
+});
+
+// Explicitly serve static assets
+app.use('/assets', express.static(path.join(__dirname, 'assets'), { dotfiles: 'ignore' }));
+
+app.get('/css2.css', (req: Request, res: Response) => {
+  const cssFile = path.join(__dirname, 'css2.css');
+  if (fs.existsSync(cssFile)) {
+    return res.sendFile(cssFile);
+  }
+  return res.status(404).send('Not found');
+});
 
 // SPA fallback for all unhandled client routes
 app.get('*', (req: Request, res: Response) => {
